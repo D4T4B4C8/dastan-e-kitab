@@ -597,6 +597,7 @@ const BOOKS = [
   { id:'b38', title:'Building a StoryBrand', price:50, img:'front_image/38.png' },
   { id:'b39', title:'Built to Last: Successful Habits of Visionary Companies', price:50, img:'front_image/39.png' },
   { id:'b40', title:'Built to Sell', price:50, img:'front_image/40.png' },
+  { id:'b41', title:'Clockwork', price:50, img:'front_image/41.png' },
 ];
 
 const UPI_PAYEE = '7683044711@ptsbi';
@@ -610,9 +611,7 @@ let state = {
   lastOrderKey: null,
 };
 
-// Where the last storage read/write actually succeeded: 'netlify' | 'claude' | 'local' | 'unknown'.
-// 'netlify' = permanent shared storage (Netlify Blobs) — survives redeploys/file replacement.
-let cloudStatus = 'unknown';
+const hasCloud = !!(window.storage && typeof window.storage.set === 'function');
 
 // ---------- routing ----------
 function isAdminRoute(){
@@ -813,43 +812,17 @@ function validateInfo(){
   return ok;
 }
 
-// ---------- storage ----------
-// Three tiers, tried in order, each one a fallback for the last:
-//   1) Netlify Blobs, via our own serverless function. This is the real
-//      backend once deployed — permanent, shared across every device, and
-//      completely decoupled from index.html. Adding books by deleting and
-//      re-uploading this file (or any redeploy) never touches it.
-//   2) Claude's built-in artifact storage — only present while previewing
-//      this page inside Claude.ai, handy before you've deployed anywhere.
-//   3) This browser's localStorage — last resort so the flow still works
-//      offline or opened as a bare local file, but orders then only live
-//      on that one device/browser.
-const ORDERS_API = '/.netlify/functions/orders';
-
+// ---------- storage (cloud when available inside Claude, local fallback otherwise) ----------
 async function storageSet(key, valueObj){
-  // 1) Netlify Blobs backend
-  try{
-    const res = await fetch(ORDERS_API, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ key, order: valueObj }),
-    });
-    if (res.ok){ cloudStatus = 'netlify'; return 'netlify'; }
-  }catch(e){ /* not deployed on Netlify yet, or offline */ }
-
-  // 2) Claude artifact storage (preview only)
-  if (window.storage && typeof window.storage.set === 'function'){
+  const value = JSON.stringify(valueObj);
+  if (hasCloud){
     try{
-      await window.storage.set(key, JSON.stringify(valueObj), true);
-      cloudStatus = 'claude';
-      return 'claude';
-    }catch(e){ console.error('claude storage set failed', e); }
+      await window.storage.set(key, value, true);
+      return 'cloud';
+    }catch(e){ console.error('cloud storage set failed', e); }
   }
-
-  // 3) local fallback
   try{
-    localStorage.setItem('dek_' + key, JSON.stringify(valueObj));
-    cloudStatus = 'local';
+    localStorage.setItem('dek_' + key, value);
     return 'local';
   }catch(e){ console.error('local storage set failed', e); }
   return null;
@@ -857,40 +830,19 @@ async function storageSet(key, valueObj){
 
 async function storageGetAllOrders(){
   const orders = {};
-  let sawNetlify = false;
-  let sawClaude = false;
-
-  // 1) Netlify Blobs backend
-  try{
-    const res = await fetch(ORDERS_API + '?t=' + Date.now(), { cache: 'no-store' });
-    if (res.ok){
-      const data = await res.json();
-      if (data && data.orders){
-        Object.assign(orders, data.orders);
-        sawNetlify = true;
-      }
-    }
-  }catch(e){ /* not deployed on Netlify yet, or offline */ }
-
-  // 2) Claude artifact storage (preview only) — merged in, doesn't overwrite Netlify data
-  if (window.storage && typeof window.storage.list === 'function'){
+  if (hasCloud){
     try{
       const list = await window.storage.list('order_', true);
       if (list && list.keys){
-        sawClaude = true;
         for (const key of list.keys){
-          if (orders[key]) continue;
           try{
             const res = await window.storage.get(key, true);
             if (res && res.value) orders[key] = JSON.parse(res.value);
           }catch(e){ /* key may have been removed */ }
         }
       }
-    }catch(e){ console.error('claude storage list failed', e); }
+    }catch(e){ console.error('cloud storage list failed', e); }
   }
-
-  // 3) local fallback / merge — also picks up orders saved before the
-  //    backend was reachable (e.g. saved while offline)
   try{
     for (let idx=0; idx<localStorage.length; idx++){
       const k = localStorage.key(idx);
@@ -902,19 +854,7 @@ async function storageGetAllOrders(){
       }
     }
   }catch(e){ /* localStorage may be unavailable */ }
-
-  cloudStatus = sawNetlify ? 'netlify' : (sawClaude ? 'claude' : 'local');
   return orders;
-}
-
-function storageNoteText(){
-  if (cloudStatus === 'netlify'){
-    return "Orders are saved to permanent shared cloud storage (Netlify Blobs). This log shows every order placed by anyone, from any device — and it stays intact no matter how many times you replace or redeploy this page's file.";
-  }
-  if (cloudStatus === 'claude'){
-    return "You're previewing inside Claude, so orders are saved to Claude's built-in shared storage for now. Once you deploy this site to Netlify (with the included netlify/functions/orders.js), orders will move to permanent Netlify Blobs storage instead.";
-  }
-  return "Cloud storage isn't reachable right now (opened as a plain file, offline, or the Netlify function isn't deployed yet), so orders are only being saved to this browser's local storage.";
 }
 
 async function saveOrder(){
@@ -1082,7 +1022,11 @@ function renderAdmin(){
       <p class="admin-sub">All book orders submitted through the form.</p>
       <button class="refresh-btn" id="refreshAdmin">Refresh</button>
       <div id="adminTableWrap"><p class="empty-note">Loading…</p></div>
-      <div class="storage-note" id="storageNote">Checking storage…</div>
+      <div class="storage-note">
+        ${hasCloud
+          ? "Orders are saved to shared cloud storage, so this log shows every order placed by anyone, from any device."
+          : "Cloud storage is not available in this environment (usually because the page was opened as a plain downloaded file instead of inside Claude). Orders are being saved to this browser's local storage instead, so this log only shows orders placed on this same device and browser."}
+      </div>
     </div>
   `;
 }
@@ -1093,8 +1037,6 @@ async function loadAdminData(){
   if (refreshBtn) refreshBtn.addEventListener('click', loadAdminData);
   try{
     const ordersMap = await storageGetAllOrders();
-    const noteEl = document.getElementById('storageNote');
-    if (noteEl) noteEl.textContent = storageNoteText();
     const orders = Object.values(ordersMap);
     if (orders.length === 0){
       wrap.innerHTML = '<p class="empty-note">No orders yet.</p>';
